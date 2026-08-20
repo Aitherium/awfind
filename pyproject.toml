@@ -32,6 +32,15 @@ license-files = ["LICENSE"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# The monorepo quality gate runs `ruff --isolated` from the REPO ROOT, where
+# first-party detection cannot see this directory, so it files `awfind` as
+# third-party. Rooted here, ruff would instead detect it as first-party and
+# demand the OPPOSITE import layout -- two invocations giving mutually
+# exclusive verdicts on the same file, each `--fix` undoing the other.
+# Measured: that is exactly what happened, twice, before this line existed.
+# Empty `src` disables path-based detection so the local run agrees with the
+# gate that actually blocks a merge.
+src = []
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
