@@ -7,8 +7,6 @@ the mutation guards that prove each assertion can still fail.
 from __future__ import annotations
 
 import pytest
-from awfind.cli import main
-
 from awfind import (
     MODES,
     QUERY_MAX_CHARS,
@@ -19,6 +17,7 @@ from awfind import (
     Result,
     search_body,
 )
+from awfind.cli import main
 
 
 def test_search_body_is_exactly_the_declared_field_set():

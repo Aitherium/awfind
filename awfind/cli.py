@@ -34,6 +34,20 @@ from awfind.client import (
 # passing one.
 
 
+def _refuses(query: str, **kwargs: object) -> bool:
+    """True when search_body rejects this call.
+
+    A named helper rather than a bare `except ValueError: pass` at each site: the
+    swallowing shape is how a check that no longer checks anything still reads as
+    a check.
+    """
+    try:
+        search_body(query, **kwargs)  # type: ignore[arg-type]
+    except ValueError:
+        return True
+    return False
+
+
 def _self_test() -> int:
     failures: list[str] = []
 
@@ -56,22 +70,14 @@ def _self_test() -> int:
     # 3. The refusals the service also makes, made here — with the reason, not an
     #    empty result set.
     for bad, why in ((" ", "empty"), ("", "empty"), ("x" * (QUERY_MAX_CHARS + 1), "too long")):
-        try:
-            search_body(bad)
-        except ValueError:
-            pass
-        else:
+        if not _refuses(bad):
             failures.append(f"search_body accepted a query that is {why}")
     if len(search_body("x" * QUERY_MAX_CHARS)["query"]) != QUERY_MAX_CHARS:
         failures.append("a query exactly at the limit was refused; the bound is inclusive")
 
     # 4. An unknown mode is refused rather than sent. Sent, it would be ignored
     #    and silently answered as the service's default.
-    try:
-        search_body("q", mode="sideways")
-    except ValueError:
-        pass
-    else:
+    if not _refuses("q", mode="sideways"):
         failures.append("an unknown mode was accepted")
     for m in MODES:
         if search_body("q", mode=m)["mode"] != m:
