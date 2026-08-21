@@ -9,8 +9,7 @@
   "adopt": "Ask one question and get ranked answers back instead of a page of results.",
   "pairs_with": [
     "awdk",
-    "awbrowse",
-    "awsh"
+    "awbrowse"
   ],
   "includes": []
 }
