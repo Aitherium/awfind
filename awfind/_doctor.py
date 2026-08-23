@@ -23,7 +23,7 @@ import sys
 #: package cannot read the registry, and a doctor that guessed at the family
 #: would go stale in silence. Regenerate to update.
 SELF = 'awfind'
-FAMILY = ['awbac', 'awbrowse', 'awdit', 'awgit', 'awgraph', 'awiam', 'awkno', 'awm', 'awmail', 'awnboard', 'awnest', 'awnet', 'awnode', 'awpredict', 'awprism', 'awreason', 'awrecover', 'awrecurse', 'awrelay', 'awrepl', 'awresearch', 'awrun', 'awseal', 'awshare', 'awtunnel']
+FAMILY = ['awask', 'awask', 'awbac', 'awbrowse', 'awdit', 'awevolve', 'awevolve', 'awgit', 'awgraph', 'awiam', 'awkno', 'awm', 'awmail', 'awnboard', 'awnest', 'awnet', 'awnode', 'awpredict', 'awprism', 'awreason', 'awrecover', 'awrecurse', 'awrelay', 'awrepl', 'awresearch', 'awrun', 'awseal', 'awshare', 'awtunnel']
 PAIRS_WITH = ['awbrowse', 'adk']
 
 #: This brick's OWN config, read out of its source at generation time.
