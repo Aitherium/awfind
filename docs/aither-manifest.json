@@ -1,0 +1,26 @@
+{
+  "schemaVersion": "1",
+  "name": "awfind",
+  "description": "A portable search client — query, results, ranking.",
+  "url": "https://aitherium.github.io/awfind/",
+  "repository": "https://github.com/Aitherium/awfind",
+  "kind": "tool",
+  "status": "public",
+  "adopt": "Ask one question and get ranked answers back instead of a page of results.",
+  "pairs_with": [
+    "awdk",
+    "awbrowse",
+    "awsh"
+  ],
+  "includes": [],
+  "metrics": {
+    "files": {
+      "value": 15,
+      "as_of": "2026-08-22T18:47:19-07:00"
+    },
+    "tests": {
+      "value": 2,
+      "as_of": "2026-08-22T18:47:19-07:00"
+    }
+  }
+}
