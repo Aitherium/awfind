@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awfind"
-version = "0.1.0"
+version = "0.2.0"
 description = "A portable client for AitherSearch-shaped web search — one query interface over whichever providers you configured, on a service you host."
 readme = "README.md"
 requires-python = ">=3.10"

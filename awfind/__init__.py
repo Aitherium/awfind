@@ -24,8 +24,18 @@ from awfind.client import (
     Result,
     search_body,
 )
+from awfind.config import (
+    ConfigError,
+    UnresolvedError,
+    config_path,
+    load_config,
+    resolve_ca_bundle,
+    resolve_token,
+    resolve_url,
+    write_config,
+)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "FindClient",
@@ -36,5 +46,13 @@ __all__ = [
     "MODES",
     "QUERY_MAX_CHARS",
     "search_body",
+    "ConfigError",
+    "UnresolvedError",
+    "config_path",
+    "load_config",
+    "resolve_url",
+    "resolve_token",
+    "resolve_ca_bundle",
+    "write_config",
     "__version__",
 ]

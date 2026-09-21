@@ -1,13 +1,23 @@
 """awfind CLI.
 
+    awfind config set --url https://search.example.com   # once, per machine
     awfind q "what changed in podman 5.4"
     awfind deep "cross-model KV cache transfer" --limit 20
     awfind providers
+    awfind doctor
     awfind --self-test
 
-The service origin comes from --url or AWFIND_URL; the token from --token or
-AWFIND_TOKEN. Neither is guessed: a search client that silently falls back to
-some default endpoint sends your queries somewhere you did not choose.
+The service origin comes from --url, then AWFIND_URL, then the config file
+(~/.aither/awfind.json, or AWFIND_CONFIG) — and then nothing. No default is
+guessed: a search client that silently falls back to some endpoint sends your
+queries somewhere you did not choose. When no rung supplies one, the error
+lists every rung it tried and the one command that ends the problem, rather
+than naming two of the three and leaving you to find the file.
+
+The token follows the same order (--token, AWFIND_TOKEN, config file) but an
+absent one is legal — plenty of these services are open on a trusted network.
+TLS trust comes from SSL_CERT_FILE, then REQUESTS_CA_BUNDLE, then the config
+file's `ca_bundle`; a service on a private CA is the normal case here.
 """
 
 from __future__ import annotations
@@ -16,6 +26,7 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
 
 from awfind.client import (
     MODES,
@@ -26,6 +37,16 @@ from awfind.client import (
     FindError,
     Result,
     search_body,
+)
+from awfind.config import (
+    ConfigError,
+    UnresolvedError,
+    config_path,
+    resolution_report,
+    resolve_ca_bundle,
+    resolve_token,
+    resolve_url,
+    write_config,
 )
 
 # ── self-test ──────────────────────────────────────────────────────────────
@@ -46,6 +67,100 @@ def _refuses(query: str, **kwargs: object) -> bool:
     except ValueError:
         return True
     return False
+
+
+def _reports_a_config_problem(path: str) -> bool:
+    """True when resolving against this config file raises ConfigError.
+
+    A named helper rather than `except ConfigError: pass` at each site, for the
+    same reason `_refuses` above is one: a bare swallowing handler is how a
+    check that no longer checks anything still reads as a check.
+    """
+    try:
+        resolve_url(None, path=path)
+    except ConfigError:
+        return True
+    except UnresolvedError:
+        # Nothing was configured at all — a DIFFERENT answer from "your config
+        # is broken", and reporting it as the same would hide exactly the
+        # collapse this test exists to prevent.
+        return False
+    return False
+
+
+def _self_test_resolution() -> list[str]:
+    """Prove the resolution order, in a sandbox, with no network and no real home.
+
+    Runs inside the shipped `--self-test` rather than only in the repo's pytest
+    because the thing it proves — "this machine has no service URL and here is
+    the file to put one in" — is a property of the MACHINE, so it has to be
+    checkable on the machine that has the problem.
+    """
+    import tempfile
+
+    failures: list[str] = []
+    saved = {k: os.environ.get(k) for k in ("AWFIND_URL", "AWFIND_TOKEN",
+                                            "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = str(Path(tmp) / "awfind.json")
+
+            # a. Nothing anywhere: the error names EVERY rung, not two of three.
+            try:
+                resolve_url(None, path=cfg)
+                failures.append("an unresolvable url did not raise")
+            except UnresolvedError as exc:
+                msg = str(exc)
+                for needle in ("--url", "AWFIND_URL", cfg, "awfind config set"):
+                    if needle not in msg:
+                        failures.append(f"the unresolved-url error never mentions {needle!r}")
+
+            # b. The config file is a real rung, and the flag and env outrank it.
+            write_config("https://from-file.invalid", path=cfg)
+            if resolve_url(None, path=cfg)[0] != "https://from-file.invalid":
+                failures.append("a configured url was not used")
+            os.environ["AWFIND_URL"] = "https://from-env.invalid"
+            if resolve_url(None, path=cfg)[0] != "https://from-env.invalid":
+                failures.append("the environment did not beat the config file")
+            if resolve_url("https://from-flag.invalid", path=cfg)[0] != "https://from-flag.invalid":
+                failures.append("the flag did not beat the environment")
+            os.environ.pop("AWFIND_URL")
+
+            # c. A wrong value in the file is REPORTED. Swallowed, a typo would
+            #    print the same "nothing is configured" as an empty machine.
+            for body, why in (('{"url": "search.example.com:1"}', "a url with no scheme"),
+                              ("{not json", "an unparseable config")):
+                Path(cfg).write_text(body, encoding="utf-8")
+                if not _reports_a_config_problem(cfg):
+                    failures.append(f"{why} was accepted rather than reported")
+
+            # d. TLS trust comes from the environment these services already
+            #    use, and NEVER resolves to "do not verify".
+            Path(cfg).unlink()
+            if resolve_ca_bundle(path=cfg) != (True, "default trust store"):
+                failures.append("an unconfigured ca bundle is not the default trust store")
+            os.environ["SSL_CERT_FILE"] = "/ca.pem"
+            if resolve_ca_bundle(path=cfg)[0] != "/ca.pem":
+                failures.append("SSL_CERT_FILE was ignored")
+            os.environ.pop("SSL_CERT_FILE")
+            os.environ["REQUESTS_CA_BUNDLE"] = "/ca2.pem"
+            if resolve_ca_bundle(path=cfg)[0] != "/ca2.pem":
+                failures.append("REQUESTS_CA_BUNDLE was ignored")
+            os.environ.pop("REQUESTS_CA_BUNDLE")
+
+            # e. No token is a legal answer; refusing to run without one would
+            #    break every deployment that is simply open on a trusted network.
+            if resolve_token(None, path=cfg) != (None, "unauthenticated"):
+                failures.append("an absent token was not reported as unauthenticated")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return failures
 
 
 def _self_test() -> int:
@@ -121,6 +236,8 @@ def _self_test() -> int:
     if not issubclass(FindError, Exception):
         failures.append("FindError is not raisable")
 
+    failures.extend(_self_test_resolution())
+
     for f in failures:
         print(f"  FAIL  {f}")
     if failures:
@@ -129,6 +246,8 @@ def _self_test() -> int:
     print("  PASS  search body is exactly the declared field set, with the service's defaults")
     print("  PASS  empty/over-long queries and unknown modes are refused with a reason")
     print("  PASS  absent answer is None, missing score is 0.0, results iterate in order")
+    print("  PASS  url resolves flag > env > config file, and the error names every rung")
+    print("  PASS  a broken config is reported, not swallowed; TLS never resolves to unverified")
     print("SELF-TEST: awfind ok")
     return 0
 
@@ -137,11 +256,51 @@ def _self_test() -> int:
 
 
 def _client(args: argparse.Namespace) -> FindClient:
-    url = args.url or os.environ.get("AWFIND_URL")
-    if not url:
-        print("no service URL: pass --url or set AWFIND_URL", file=sys.stderr)
-        raise SystemExit(2)
-    return FindClient(url, args.token or os.environ.get("AWFIND_TOKEN"))
+    """Build a client from the resolution order, or raise with the whole trail.
+
+    The exceptions propagate to `main`, which prints them: the old version
+    printed and called `raise SystemExit(2)` from in here, which made the
+    message untestable without capturing stderr and made the exit code a
+    property of a helper rather than of the command.
+    """
+    cfg_path = getattr(args, "config", None)
+    url, _ = resolve_url(args.url, path=cfg_path)
+    token, _ = resolve_token(args.token, path=cfg_path)
+    verify, _ = resolve_ca_bundle(getattr(args, "ca_bundle", None), path=cfg_path)
+    return FindClient(url, token, verify=verify)
+
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    """Read or write the per-machine config file.
+
+    `set` is what turns "no service URL" from a recurring interruption into a
+    one-time one. Without it the only durable answer is an environment
+    variable the user has to re-export in every shell, every cron entry and
+    every agent that spawns a subprocess — which is why, measured, nobody
+    ever configured this client at all.
+    """
+    p = config_path(getattr(args, "config", None))
+    if args.config_cmd == "path":
+        print(p)
+        return 0
+    if args.config_cmd == "show":
+        # The token is a credential. Report its presence and length; printing
+        # it would put it in the scrollback of whoever asked a harmless
+        # question about where the config lives.
+        for line in resolution_report(args.url, args.token, path=getattr(args, "config", None)):
+            print(line)
+        return 0
+    if args.config_cmd == "set":
+        if not any((args.set_url, args.set_token, args.set_ca_bundle)):
+            print("awfind config set: nothing to set — pass --url, --token or --ca-bundle",
+                  file=sys.stderr)
+            return 2
+        where = write_config(args.set_url, args.set_token,
+                             ca_bundle=args.set_ca_bundle,
+                             path=getattr(args, "config", None))
+        print(f"wrote {where}")
+        return 0
+    return 2
 
 
 def _show(ans: Answer, as_json: bool) -> None:
@@ -179,8 +338,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="awfind", description=__doc__)
     ap.add_argument("--self-test", action="store_true",
                     help="prove this client still holds its contract, offline")
-    ap.add_argument("--url", help="service origin (or AWFIND_URL)")
-    ap.add_argument("--token", help="bearer token (or AWFIND_TOKEN)")
+    ap.add_argument("--url", help="service origin (or AWFIND_URL, or the config file)")
+    ap.add_argument("--token", help="bearer token (or AWFIND_TOKEN, or the config file)")
+    ap.add_argument("--ca-bundle", dest="ca_bundle",
+                    help="CA bundle for the service's TLS "
+                         "(or SSL_CERT_FILE / REQUESTS_CA_BUNDLE, or the config file)")
+    ap.add_argument("--config", help=f"config file to use (default {config_path()})")
     ap.add_argument("--json", action="store_true", help="print the raw response")
     sub = ap.add_subparsers(dest="cmd")
 
@@ -193,6 +356,16 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("providers", help="which backends the service has configured")
     sub.add_parser("stats", help="service counters")
 
+    cfg = sub.add_parser("config", help="where this machine looks for the service")
+    csub = cfg.add_subparsers(dest="config_cmd")
+    cset = csub.add_parser("set", help="write the service settings for this machine")
+    cset.add_argument("--url", dest="set_url", help="service origin to remember")
+    cset.add_argument("--token", dest="set_token", help="bearer token to remember")
+    cset.add_argument("--ca-bundle", dest="set_ca_bundle",
+                      help="CA bundle path to remember")
+    csub.add_parser("show", help="what each resolution rung supplies right now")
+    csub.add_parser("path", help="print the config file path and exit")
+
     args = ap.parse_args(argv)
 
     if args.self_test:
@@ -200,6 +373,16 @@ def main(argv: list[str] | None = None) -> int:
     if not args.cmd:
         ap.print_help()
         return 2
+
+    if args.cmd == "config":
+        if not getattr(args, "config_cmd", None):
+            cfg.print_help()
+            return 2
+        try:
+            return _cmd_config(args)
+        except ConfigError as exc:
+            print(f"awfind: {exc}", file=sys.stderr)
+            return 2
 
     try:
         c = _client(args)
@@ -214,6 +397,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "stats":
             print(json.dumps(c.stats(), indent=2))
             return 0
+    except (UnresolvedError, ConfigError) as exc:
+        # Configuration, not transport. Same exit code as any other "you asked
+        # wrongly": nothing was dialled, so calling it a service failure would
+        # send the reader to look at a service that is very likely fine.
+        print(f"awfind: {exc}", file=sys.stderr)
+        return 2
     except ValueError as exc:
         # A refusal made HERE, before the round trip. Distinct exit code from a
         # transport failure so a script can tell "I asked wrongly" from "it broke".
