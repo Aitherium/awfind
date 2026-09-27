@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "awfind"
-version = "0.2.0"
+version = "0.2.1"
 description = "A portable client for AitherSearch-shaped web search — one query interface over whichever providers you configured, on a service you host."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,6 +15,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]
+# `awfind mcp` -- serve find() to any MCP coding agent over stdio. Accepts the
+# 1.x FastMCP and the 2.x MCPServer (mcp_server.py says why).
+mcp = ["mcp>=1.2"]
 
 [project.scripts]
 awfind = "awfind.cli:main"

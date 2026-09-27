@@ -5,6 +5,7 @@
     awfind deep "cross-model KV cache transfer" --limit 20
     awfind providers
     awfind doctor
+    awfind mcp                                            # stdio MCP server
     awfind --self-test
 
 The service origin comes from --url, then AWFIND_URL, then the config file
@@ -355,6 +356,7 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("providers", help="which backends the service has configured")
     sub.add_parser("stats", help="service counters")
+    sub.add_parser("mcp", help="serve find() over MCP stdio for a coding agent")
 
     cfg = sub.add_parser("config", help="where this machine looks for the service")
     csub = cfg.add_subparsers(dest="config_cmd")
@@ -373,6 +375,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.cmd:
         ap.print_help()
         return 2
+
+    if args.cmd == "mcp":
+        from awfind.mcp_server import main as mcp_main
+        return mcp_main()
 
     if args.cmd == "config":
         if not getattr(args, "config_cmd", None):
