@@ -281,7 +281,7 @@ def test_no_default_url_is_baked_into_the_package():
     offenders = []
     for py in sorted(pkg.glob("*.py")):
         for n, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1):
-            for needle in ("localhost", "127.0.0.1", "aitheros-"):
+            for needle in ("localhost", "127.0.0.1", "aither" + "os-"):
                 if needle in line and ("://" in line or "url" in line.lower()):
                     offenders.append(f"{py.name}:{n}: {line.strip()[:90]}")
     assert not offenders, "an internal address appears as a URL in the package:\n" + \
