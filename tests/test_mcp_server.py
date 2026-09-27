@@ -135,7 +135,7 @@ def test_server_declares_find_and_find_providers():
     assert set(tools) == {"find", "find_providers"}
     desc = tools["find"].description
     assert "web_search" in desc and "PREFER" in desc
-    assert {"query", "limit", "sources"} <= set(tools["find"].inputSchema["properties"])
+    assert {"query", "limit", "sources"} <= set((getattr(tools["find"], "input_schema", None) or tools["find"].inputSchema)["properties"])
 
 
 def test_server_find_routes_through_run_find(monkeypatch):
