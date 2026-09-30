@@ -33,7 +33,7 @@ PAIRS_WITH = ['awbrowse', 'adk', 'awembed']
 #: platform-wide vars it also touches would be noise, and a doctor that floods
 #: gets ignored.
 ENV_REQUIRED = []
-ENV_OPTIONAL = ['AWFIND_TOKEN', 'AWFIND_URL']
+ENV_OPTIONAL = []
 
 
 def _installed(mod: str) -> "str | None":
