@@ -41,6 +41,8 @@ class FakeClient:
     def providers(self):
         return {"providers": [{"name": "duckduckgo", "available": True}]}
 
+ALL_TOOLS = {"find", "find_providers", "find_contents", "find_answer", "find_similar"}
+
 
 def hit(url, score, source="duckduckgo", title="t"):
     return {"title": title, "url": url, "snippet": "s", "source": source, "score": score}
@@ -132,7 +134,7 @@ def _text(result) -> str:
 def test_server_declares_find_and_find_providers():
     server = mcp_server.build_server()
     tools = {t.name: t for t in asyncio.run(server.list_tools())}
-    assert set(tools) == {"find", "find_providers"}
+    assert set(tools) == ALL_TOOLS
     desc = tools["find"].description
     assert "web_search" in desc and "PREFER" in desc
     assert {"query", "limit", "sources"} <= set((getattr(tools["find"], "input_schema", None) or tools["find"].inputSchema)["properties"])
@@ -166,7 +168,7 @@ def test_cli_mcp_starts_fast_and_lists_tools_over_stdio():
         send({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         listed = json.loads(proc.stdout.readline())
         elapsed = time.monotonic() - t0
-        assert {t["name"] for t in listed["result"]["tools"]} == {"find", "find_providers"}
+        assert {t["name"] for t in listed["result"]["tools"]} == ALL_TOOLS
         assert elapsed < 10, f"server took {elapsed:.1f}s to list tools"
     finally:
         proc.kill()

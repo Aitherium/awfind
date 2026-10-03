@@ -97,12 +97,18 @@ def _build_mcp_server(name: str, instructions: str):
 def _client():
     """A FindClient from the CLI's resolution order. Raises with the whole trail."""
     from awfind.client import FindClient
-    from awfind.config import resolve_ca_bundle, resolve_token, resolve_url
+    from awfind.config import (
+        resolve_browser_url,
+        resolve_ca_bundle,
+        resolve_token,
+        resolve_url,
+    )
 
     url, _ = resolve_url(None)
     token, _ = resolve_token(None)
     verify, _ = resolve_ca_bundle(None)
-    return FindClient(url, token, verify=verify)
+    browser, _ = resolve_browser_url(None)
+    return FindClient(url, token, verify=verify, browser_url=browser)
 
 
 def rank(answers: list, limit: int) -> list[dict]:
@@ -205,6 +211,52 @@ def run_providers(client: Any = None) -> str:
         return f"providers FAILED: {exc}"
 
 
+def _guarded(fn, client: Any = None) -> str:
+    """Run one tool body; configuration and service failures come back as text."""
+    from awfind.client import FindError
+    from awfind.config import ConfigError, UnresolvedError
+
+    try:
+        return fn(client or _client())
+    except (UnresolvedError, ConfigError) as exc:
+        return f"awfind is not configured on this machine: {exc}"
+    except ValueError as exc:
+        return f"Refused: {exc}"
+    except FindError as exc:
+        return f"FAILED: {exc}"
+
+
+def run_contents(url: str, max_chars: int = 6000, client: Any = None) -> str:
+    """The body of the `find_contents` tool."""
+    def go(c):
+        pg = c.contents(url)
+        text = pg.content if max_chars <= 0 else pg.content[:max_chars]
+        return json.dumps({"url": pg.url, "title": pg.title, "words": pg.words,
+                           "method": pg.raw.get("extraction_method", ""),
+                           "truncated": len(text) < len(pg.content), "content": text},
+                          indent=1)
+    return _guarded(go, client)
+
+
+def run_answer(question: str, sources: int = 3, client: Any = None) -> str:
+    """The body of the `find_answer` tool."""
+    def go(c):
+        a = c.answer(question, max_sources=max(1, min(int(sources or 3), 8)))
+        return json.dumps({"answer": a.answer, "citations": a.citations}, indent=1)
+    return _guarded(go, client)
+
+
+def run_similar(url: str, limit: int = 10, provider: Optional[str] = None,
+                client: Any = None) -> str:
+    """The body of the `find_similar` tool."""
+    def go(c):
+        ans = c.similar(url, limit=max(1, min(int(limit or 10), MAX_LIMIT)),
+                        provider=provider)
+        return json.dumps({"similar_to": url, "query": ans.raw.get("similar_query"),
+                           "results": rank([ans], MAX_LIMIT)}, indent=1)
+    return _guarded(go, client)
+
+
 def build_server():
     """Construct the MCP server. Raises ImportError if `mcp` is absent."""
     server = _build_mcp_server(
@@ -241,6 +293,37 @@ def build_server():
         import asyncio
 
         return await asyncio.to_thread(run_providers)
+
+    @server.tool(
+        name="find_contents",
+        description=("Clean text of one URL (title, word count, extraction method). "
+                     "Falls back from extraction to fetch to a real browser render "
+                     "when a site refuses bots. Use after find() on the 1-3 best hits."),
+    )
+    async def find_contents(url: str, max_chars: int = 6000) -> str:
+        import asyncio
+
+        return await asyncio.to_thread(run_contents, url, max_chars)
+
+    @server.tool(
+        name="find_answer",
+        description=("One synthesized answer to a question, with the URLs it cites. "
+                     "Quote only these citations. Max 512 chars of question."),
+    )
+    async def find_answer(question: str, sources: int = 3) -> str:
+        import asyncio
+
+        return await asyncio.to_thread(run_answer, question, sources)
+
+    @server.tool(
+        name="find_similar",
+        description=("Pages like a URL: reads it, searches by what it says it is, "
+                     "drops the page itself. provider='exa' ranks by meaning."),
+    )
+    async def find_similar(url: str, limit: int = 10, provider: Optional[str] = None) -> str:
+        import asyncio
+
+        return await asyncio.to_thread(run_similar, url, limit, provider)
 
     return server
 

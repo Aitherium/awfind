@@ -3,6 +3,11 @@
     awfind config set --url https://search.example.com   # once, per machine
     awfind q "what changed in podman 5.4"
     awfind deep "cross-model KV cache transfer" --limit 20
+    awfind contents https://example.com                   # clean page text
+    awfind similar https://example.com --provider exa     # pages like this one
+    awfind answer "latest stable podman"                  # answer + citations
+    awfind --account work q "..."                         # a named account
+    awfind agent-readme                                   # the manual, for an LLM
     awfind providers
     awfind doctor
     awfind mcp                                            # stdio MCP server
@@ -34,19 +39,30 @@ from awfind.client import (
     QUERY_MAX_CHARS,
     SEARCH_FIELDS,
     Answer,
+    Cited,
     FindClient,
     FindError,
+    Page,
     Result,
+    page_from_fetch,
+    page_from_render,
+    parse_cited,
     search_body,
+    similar_query,
 )
 from awfind.config import (
     ConfigError,
     UnresolvedError,
     config_path,
+    list_accounts,
+    remove_account,
     resolution_report,
+    resolve_browser_url,
     resolve_ca_bundle,
     resolve_token,
     resolve_url,
+    set_default_account,
+    write_account,
     write_config,
 )
 
@@ -164,6 +180,57 @@ def _self_test_resolution() -> list[str]:
     return failures
 
 
+def _self_test_accounts() -> list[str]:
+    """Named accounts: overlay, explicit pick, and a loud unknown name. Sandboxed."""
+    import tempfile
+
+    failures: list[str] = []
+    saved = {k: os.environ.get(k) for k in ("AWFIND_URL", "AWFIND_TOKEN", "AWFIND_ACCOUNT",
+                                            "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")}
+    try:
+        for k in saved:
+            os.environ.pop(k, None)
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = str(Path(tmp) / "awfind.json")
+            write_config("https://home.invalid", "home-token", ca_bundle="/ca.pem", path=cfg)
+            write_account("work", "https://work.invalid", "work-token", path=cfg)
+            if resolve_url(None, path=cfg)[0] != "https://home.invalid":
+                failures.append("no account picked should mean the top level")
+            if resolve_url(None, path=cfg, account="work")[0] != "https://work.invalid":
+                failures.append("--account work did not pick the work url")
+            if resolve_token(None, path=cfg, account="work")[0] != "work-token":
+                failures.append("--account work did not pick the work token")
+            if resolve_ca_bundle(None, path=cfg, account="work")[0] != "/ca.pem":
+                failures.append("an account did not inherit the top-level ca_bundle")
+            os.environ["AWFIND_ACCOUNT"] = "work"
+            if resolve_url(None, path=cfg)[0] != "https://work.invalid":
+                failures.append("AWFIND_ACCOUNT was ignored")
+            os.environ.pop("AWFIND_ACCOUNT")
+            try:
+                resolve_token(None, path=cfg, account="nope")
+                failures.append("an unknown account fell back instead of failing")
+            except ConfigError as exc:
+                if "work" not in str(exc):
+                    failures.append("the unknown-account error does not list known accounts")
+            set_default_account("work", path=cfg)
+            if resolve_url(None, path=cfg)[0] != "https://work.invalid":
+                failures.append("default_account was ignored")
+            rows = list_accounts(path=cfg)
+            if rows != [("work", "https://work.invalid", True, True)]:
+                failures.append(f"list_accounts wrong: {rows}")
+            if not remove_account("work", path=cfg):
+                failures.append("remove_account did not find the account")
+            if resolve_url(None, path=cfg)[0] != "https://home.invalid":
+                failures.append("removing the default account did not clear default_account")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    return failures
+
+
 def _self_test() -> int:
     failures: list[str] = []
 
@@ -237,7 +304,52 @@ def _self_test() -> int:
     if not issubclass(FindError, Exception):
         failures.append("FindError is not raisable")
 
+    # 11. The research route reports failure inside a 200. It must RAISE, and a
+    #     real answer must keep its citations, deduplicated, in order.
+    try:
+        parse_cited("q", "[WEB_RESEARCH_ERROR: search failed: boom]")
+        failures.append("an in-band research error parsed as an answer")
+    except FindError:
+        pass
+    cited = parse_cited("q", "[WEB_RESEARCH: q] synthesized from 2 sources:\n"
+                             "It is 6.1 (source: https://a.example/x). "
+                             "See https://b.example/y, and https://a.example/x. "
+                             "(source: https://w.example/A_(b))")
+    if cited.citations != ["https://a.example/x", "https://b.example/y",
+                           "https://w.example/A_(b)"]:
+        failures.append(f"citations parsed wrong: {cited.citations}")
+    if cited.answer.startswith("[WEB_RESEARCH"):
+        failures.append("the research header leaked into the answer")
+
+    # 12. similar() searches by what the page says it is, within the bound.
+    q = similar_query(Page({"url": "https://e.x", "title": "Exa CLI",
+                            "description": "neural search " * 80}))
+    if not q.startswith("Exa CLI") or len(q) > QUERY_MAX_CHARS:
+        failures.append(f"similar_query wrong or over the bound: {len(q)} chars")
+    try:
+        similar_query(Page({"url": "https://e.x"}))
+        failures.append("a page with nothing to search by produced a query")
+    except ValueError:
+        pass
+
+    # 13. The /fetch fallback still yields a title and description to search by.
+    pg = page_from_fetch("https://e.x", {"content": "# Exa CLI\n\n> Neural search.\n\nbody"})
+    if (pg.title, pg.description, pg.raw.get("extraction_method")) != (
+            "Exa CLI", "Neural search.", "fetch"):
+        failures.append(f"page_from_fetch parsed wrong: {pg.title!r} {pg.description!r}")
+
+    # 14. A render carries text only; an empty render raises rather than
+    #     passing as a blank page.
+    if page_from_render("https://e.x", {"content": "hi there", "engine": "pw"}).words != 2:
+        failures.append("page_from_render did not count words")
+    try:
+        page_from_render("https://e.x", {"content": "  "})
+        failures.append("an empty render passed as a page")
+    except FindError:
+        pass
+
     failures.extend(_self_test_resolution())
+    failures.extend(_self_test_accounts())
 
     for f in failures:
         print(f"  FAIL  {f}")
@@ -249,6 +361,8 @@ def _self_test() -> int:
     print("  PASS  absent answer is None, missing score is 0.0, results iterate in order")
     print("  PASS  url resolves flag > env > config file, and the error names every rung")
     print("  PASS  a broken config is reported, not swallowed; TLS never resolves to unverified")
+    print("  PASS  research errors raise; citations parse in order; similar() stays in bound")
+    print("  PASS  named accounts overlay the top level; an unknown name fails loudly")
     print("SELF-TEST: awfind ok")
     return 0
 
@@ -265,10 +379,14 @@ def _client(args: argparse.Namespace) -> FindClient:
     property of a helper rather than of the command.
     """
     cfg_path = getattr(args, "config", None)
-    url, _ = resolve_url(args.url, path=cfg_path)
-    token, _ = resolve_token(args.token, path=cfg_path)
-    verify, _ = resolve_ca_bundle(getattr(args, "ca_bundle", None), path=cfg_path)
-    return FindClient(url, token, verify=verify)
+    acct = getattr(args, "account", None)
+    url, _ = resolve_url(args.url, path=cfg_path, account=acct)
+    token, _ = resolve_token(args.token, path=cfg_path, account=acct)
+    verify, _ = resolve_ca_bundle(getattr(args, "ca_bundle", None), path=cfg_path,
+                                  account=acct)
+    browser, _ = resolve_browser_url(getattr(args, "browser_url", None), path=cfg_path,
+                                     account=acct)
+    return FindClient(url, token, verify=verify, browser_url=browser)
 
 
 def _cmd_config(args: argparse.Namespace) -> int:
@@ -288,20 +406,84 @@ def _cmd_config(args: argparse.Namespace) -> int:
         # The token is a credential. Report its presence and length; printing
         # it would put it in the scrollback of whoever asked a harmless
         # question about where the config lives.
-        for line in resolution_report(args.url, args.token, path=getattr(args, "config", None)):
+        for line in resolution_report(args.url, args.token, path=getattr(args, "config", None),
+                                      account=getattr(args, "account", None)):
             print(line)
         return 0
     if args.config_cmd == "set":
-        if not any((args.set_url, args.set_token, args.set_ca_bundle)):
-            print("awfind config set: nothing to set — pass --url, --token or --ca-bundle",
-                  file=sys.stderr)
+        if not any((args.set_url, args.set_token, args.set_ca_bundle, args.set_browser_url)):
+            print("awfind config set: nothing to set — pass --url, --token, --ca-bundle "
+                  "or --browser-url", file=sys.stderr)
             return 2
         where = write_config(args.set_url, args.set_token,
                              ca_bundle=args.set_ca_bundle,
-                             path=getattr(args, "config", None))
+                             path=getattr(args, "config", None),
+                             browser_url=args.set_browser_url)
         print(f"wrote {where}")
         return 0
     return 2
+
+
+def _cmd_accounts(args: argparse.Namespace) -> int:
+    """Named accounts: one service + bearer per name, picked with --account."""
+    cfg_path = getattr(args, "config", None)
+    if args.accounts_cmd == "list":
+        rows = list_accounts(path=cfg_path)
+        if args.json:
+            print(json.dumps([{"name": n, "url": u, "token": t, "default": d}
+                              for n, u, t, d in rows], indent=2))
+            return 0
+        if not rows:
+            print("no named accounts — add one: awfind accounts add <name> --url https://...")
+        for name, url, has_tok, default in rows:
+            print(f"{'*' if default else ' '} {name:<14} {url}  "
+                  f"{'token set' if has_tok else 'no token'}")
+        return 0
+    if args.accounts_cmd == "add":
+        where = write_account(args.name, args.set_url, args.set_token,
+                              ca_bundle=args.set_ca_bundle, path=cfg_path)
+        print(f"account {args.name!r} written to {where}")
+        return 0
+    if args.accounts_cmd == "rm":
+        if not remove_account(args.name, path=cfg_path):
+            print(f"awfind: no account named {args.name!r}", file=sys.stderr)
+            return 2
+        print(f"account {args.name!r} removed")
+        return 0
+    if args.accounts_cmd == "default":
+        name = None if args.name in ("-", "none") else args.name
+        set_default_account(name, path=cfg_path)
+        print(f"default account: {name or '(top level)'}")
+        return 0
+    return 2
+
+
+def _show_pages(pages: list, as_json: bool, max_chars: int) -> None:
+    if as_json:
+        print(json.dumps([pg.raw for pg in pages], indent=2))
+        return
+    for pg in pages:
+        print(f"# {pg.title or '(untitled)'}\n{pg.url}  ({pg.words} words)")
+        if pg.published:
+            print(f"published {pg.published}")
+        text = pg.content if max_chars <= 0 else pg.content[:max_chars]
+        print()
+        print(text)
+        if max_chars > 0 and len(pg.content) > max_chars:
+            print(f"\n[... {len(pg.content) - max_chars} more chars; --max-chars 0 for all]")
+        print()
+
+
+def _show_cited(c: Cited, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps({"question": c.question, "answer": c.answer,
+                          "citations": c.citations}, indent=2))
+        return
+    print(c.answer)
+    if c.citations:
+        print()
+        for i, u in enumerate(c.citations, 1):
+            print(f"[{i}] {u}")
 
 
 def _show(ans: Answer, as_json: bool) -> None:
@@ -346,6 +528,10 @@ def main(argv: list[str] | None = None) -> int:
                          "(or SSL_CERT_FILE / REQUESTS_CA_BUNDLE, or the config file)")
     ap.add_argument("--config", help=f"config file to use (default {config_path()})")
     ap.add_argument("--json", action="store_true", help="print the raw response")
+    ap.add_argument("--browser-url", dest="browser_url",
+                    help="rendering fallback for contents (or AWFIND_BROWSER_URL)")
+    ap.add_argument("--account",
+                    help="named account from the config file (or AWFIND_ACCOUNT)")
     sub = ap.add_subparsers(dest="cmd")
 
     for name, help_text in (("q", "quick search"), ("deep", "deep search")):
@@ -353,6 +539,33 @@ def main(argv: list[str] | None = None) -> int:
         p.add_argument("query", nargs="+")
         p.add_argument("--limit", type=int, default=10)
         p.add_argument("--provider")
+
+    pc = sub.add_parser("contents", help="clean contents of one or more URLs")
+    pc.add_argument("urls", nargs="+")
+    pc.add_argument("--max-chars", type=int, default=4000,
+                    help="truncate each page's text (0 = no limit)")
+    ps = sub.add_parser("similar", help="pages like this URL")
+    ps.add_argument("target", metavar="url")
+    ps.add_argument("--limit", type=int, default=10)
+    ps.add_argument("--provider", help="e.g. exa for neural ranking")
+    ps.add_argument("--deep", action="store_true", help="deep search instead of quick")
+    pa = sub.add_parser("answer", help="one answer with the URLs it cites")
+    pa.add_argument("question", nargs="+")
+    pa.add_argument("--sources", type=int, default=3, help="pages to read (default 3)")
+    sub.add_parser("agent-readme", help="print the operating manual for an LLM")
+
+    acc = sub.add_parser("accounts", help="named service accounts (pick with --account)")
+    asub = acc.add_subparsers(dest="accounts_cmd")
+    asub.add_parser("list", help="every account; tokens are never printed")
+    aadd = asub.add_parser("add", help="create or update a named account")
+    aadd.add_argument("name")
+    aadd.add_argument("--url", dest="set_url")
+    aadd.add_argument("--token", dest="set_token")
+    aadd.add_argument("--ca-bundle", dest="set_ca_bundle")
+    arm = asub.add_parser("rm", help="delete a named account")
+    arm.add_argument("name")
+    adef = asub.add_parser("default", help="make an account the default ('-' clears it)")
+    adef.add_argument("name")
 
     sub.add_parser("providers", help="which backends the service has configured")
     sub.add_parser("stats", help="service counters")
@@ -365,6 +578,8 @@ def main(argv: list[str] | None = None) -> int:
     cset.add_argument("--token", dest="set_token", help="bearer token to remember")
     cset.add_argument("--ca-bundle", dest="set_ca_bundle",
                       help="CA bundle path to remember")
+    cset.add_argument("--browser-url", dest="set_browser_url",
+                      help="rendering service for sites that refuse plain fetchers")
     csub.add_parser("show", help="what each resolution rung supplies right now")
     csub.add_parser("path", help="print the config file path and exit")
 
@@ -377,8 +592,26 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.cmd == "mcp":
+        if args.account:
+            # The MCP server resolves its connection once, from the environment.
+            os.environ["AWFIND_ACCOUNT"] = args.account
         from awfind.mcp_server import main as mcp_main
         return mcp_main()
+
+    if args.cmd == "agent-readme":
+        from awfind.agent_readme import AGENT_README
+        sys.stdout.write(AGENT_README)
+        return 0
+
+    if args.cmd == "accounts":
+        if not getattr(args, "accounts_cmd", None):
+            acc.print_help()
+            return 2
+        try:
+            return _cmd_accounts(args)
+        except ConfigError as exc:
+            print(f"awfind: {exc}", file=sys.stderr)
+            return 2
 
     if args.cmd == "config":
         if not getattr(args, "config_cmd", None):
@@ -396,6 +629,17 @@ def main(argv: list[str] | None = None) -> int:
             query = " ".join(args.query)
             fn = c.quick if args.cmd == "q" else c.deep
             _show(fn(query, limit=args.limit, provider=args.provider), args.json)
+            return 0
+        if args.cmd == "contents":
+            _show_pages([c.contents(u) for u in args.urls], args.json, args.max_chars)
+            return 0
+        if args.cmd == "similar":
+            _show(c.similar(args.target, limit=args.limit, provider=args.provider,
+                            mode="deep" if args.deep else "quick"), args.json)
+            return 0
+        if args.cmd == "answer":
+            _show_cited(c.answer(" ".join(args.question), max_sources=args.sources),
+                        args.json)
             return 0
         if args.cmd == "providers":
             print(json.dumps(c.providers(), indent=2))

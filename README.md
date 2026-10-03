@@ -35,6 +35,37 @@ awfind doctor             # what this machine resolves, and why
 awfind --self-test        # prove the contract, offline
 ```
 
+### Contents, similar pages, cited answers (0.3.0)
+
+```bash
+awfind contents https://example.com https://another.example   # clean page text
+awfind similar https://example.com --provider exa              # pages like this one
+awfind answer "latest stable podman"                           # answer + cited URLs
+awfind --json answer "latest stable podman" | jq -r '.citations[]'
+awfind agent-readme       # the full operating manual, for an LLM
+```
+
+`contents` tries the service's extractor, then its markdown fetcher, then, if a
+`browser_url` is configured (`awfind config set --browser-url https://...` or
+`AWFIND_BROWSER_URL`), a real browser render. Sites that refuse bots still come
+back as text. The browser host is never sent the search bearer.
+
+### Named accounts
+
+```bash
+awfind accounts add work --url https://search.work.example --token ...
+awfind --account work q "..."      # or AWFIND_ACCOUNT=work
+awfind accounts default work       # '-' goes back to the top-level keys
+awfind accounts list               # tokens are never printed
+```
+
+Naming an account that does not exist is an error that lists the ones that do.
+It never falls back to the default, because that would send the bearer to the
+service you were trying not to use.
+
+`awfind mcp` exposes the same verbs as `find_contents`, `find_answer` and
+`find_similar`, next to `find` and `find_providers`.
+
 ## Where it looks for the service
 
 Highest first, for both the URL and the token:

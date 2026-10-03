@@ -34,6 +34,22 @@ library's own trust store. Those two variable names are not invented here —
 they are what OpenSSL and requests already read, and a service on a private CA
 is the normal case for this client, not the exotic one.
 
+NAMED ACCOUNTS
+==============
+One machine often talks to more than one service (a home fleet and a work
+deployment) with a different bearer for each. The config file can hold named
+sections under ``accounts``::
+
+    {"url": "...", "accounts": {"work": {"url": "...", "token": "..."}},
+     "default_account": "work"}
+
+The account is picked by ``--account``, then ``AWFIND_ACCOUNT``, then
+``default_account``; with none of those the top-level keys are used. A named
+account's keys OVERLAY the top-level ones, so a shared ``ca_bundle`` is written
+once. Naming an account that does not exist is a ConfigError that lists the
+ones that do: falling back to the top level would send the query, and the
+bearer, to the service you were trying NOT to use.
+
 A BAD VALUE IS REPORTED, NEVER SWALLOWED
 ========================================
 A config file that is missing is a fact; a config file that exists and is
@@ -64,6 +80,15 @@ __all__ = [
     "resolve_ca_bundle",
     "write_config",
     "resolution_report",
+    "ACCOUNT_ENV",
+    "resolve_account",
+    "effective_config",
+    "list_accounts",
+    "write_account",
+    "remove_account",
+    "set_default_account",
+    "BROWSER_ENV",
+    "resolve_browser_url",
 ]
 
 #: The environment variable that MOVES the config file. Named so a test, a
@@ -72,6 +97,8 @@ __all__ = [
 CONFIG_ENV = "AWFIND_CONFIG"
 URL_ENV = "AWFIND_URL"
 TOKEN_ENV = "AWFIND_TOKEN"
+ACCOUNT_ENV = "AWFIND_ACCOUNT"
+BROWSER_ENV = "AWFIND_BROWSER_URL"
 
 #: Read in this order. Both are pre-existing conventions: OpenSSL reads the
 #: first, requests the second. Inventing a third name would mean a machine
@@ -82,7 +109,10 @@ CA_ENVS = ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE")
 #: ALONE on a write and ignored on a read: the file belongs to the user, and a
 #: client that pruned what it did not recognise would delete the next version's
 #: settings every time an older one ran.
-KNOWN_KEYS = ("url", "token", "ca_bundle")
+KNOWN_KEYS = ("url", "token", "ca_bundle", "browser_url", "accounts", "default_account")
+
+#: The keys one account section may carry.
+ACCOUNT_KEYS = ("url", "token", "ca_bundle", "browser_url")
 
 
 class ConfigError(RuntimeError):
@@ -154,11 +184,129 @@ def load_config(path: Optional[str] = None) -> dict:
         raise ConfigError(f"{p}: config must be a JSON object, got {type(data).__name__}")
     if "url" in data:
         _check_url(data["url"], str(p))
+    accounts = data.get("accounts")
+    if accounts is not None:
+        if not isinstance(accounts, dict):
+            raise ConfigError(f"{p}: accounts must be a JSON object of name -> settings")
+        for name, sec in accounts.items():
+            if not isinstance(sec, dict):
+                raise ConfigError(f"{p}: account {name!r} must be a JSON object")
+            if "url" in sec:
+                _check_url(sec["url"], f"{p} (account {name!r})")
     return data
 
 
+def resolve_account(flag: Optional[str] = None, *, config: Optional[dict] = None,
+                    path: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """(account name or None, where it came from). None means the top-level keys."""
+    if flag:
+        return flag, "--account"
+    env = os.environ.get(ACCOUNT_ENV)
+    if env:
+        return env, ACCOUNT_ENV
+    cfg = load_config(path) if config is None else config
+    default = cfg.get("default_account")
+    if default:
+        return str(default), f"{config_path(path)} default_account"
+    return None, "top level"
+
+
+def effective_config(account: Optional[str] = None, *, path: Optional[str] = None,
+                     config: Optional[dict] = None) -> dict:
+    """The config with the chosen account's keys laid over the top-level ones.
+
+    Raises ConfigError for an account that does not exist, naming the ones that
+    do. Silently using the top level instead would dial the wrong service with
+    the wrong bearer, which is the exact accident named accounts exist to stop.
+    """
+    cfg = load_config(path) if config is None else config
+    name, _ = resolve_account(account, config=cfg, path=path)
+    if name is None:
+        return cfg
+    accounts = cfg.get("accounts") or {}
+    if name not in accounts:
+        known = ", ".join(sorted(accounts)) or "none"
+        raise ConfigError(
+            f"{config_path(path)}: no account named {name!r} (known: {known}). "
+            f"Add it: awfind accounts add {name} --url https://<host>:<port>"
+        )
+    merged = {k: v for k, v in cfg.items() if k in ACCOUNT_KEYS}
+    merged.update({k: v for k, v in accounts[name].items() if k in ACCOUNT_KEYS})
+    return merged
+
+
+def list_accounts(path: Optional[str] = None) -> list:
+    """[(name, url, has_token, is_default)]. Tokens are never returned."""
+    cfg = load_config(path)
+    default = cfg.get("default_account")
+    rows = []
+    for name, sec in sorted((cfg.get("accounts") or {}).items()):
+        rows.append((name, sec.get("url") or cfg.get("url") or "",
+                     bool(sec.get("token")), name == default))
+    return rows
+
+
+def _save(p: Path, data: dict) -> Path:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        # The file may hold a bearer. Best-effort on platforms where it means
+        # something; never fatal, because a config that could not be chmod'd is
+        # still a config, and failing here would leave it written but unreported.
+        p.chmod(0o600)
+    except OSError:
+        return p
+    return p
+
+
+def write_account(name: str, url: Optional[str] = None, token: Optional[str] = None, *,
+                  ca_bundle: Optional[str] = None, path: Optional[str] = None) -> Path:
+    """Merge settings into one named account (created if absent)."""
+    if not name or not name.strip() or any(c in name for c in " /\\"):
+        raise ConfigError(f"account name must be a non-empty word, got {name!r}")
+    p = config_path(path)
+    data = load_config(path)
+    accounts = data.setdefault("accounts", {})
+    sec = accounts.setdefault(name, {})
+    if url is not None:
+        sec["url"] = _check_url(url, "--url")
+    if token is not None:
+        sec["token"] = token
+    if ca_bundle is not None:
+        sec["ca_bundle"] = ca_bundle
+    return _save(p, data)
+
+
+def remove_account(name: str, *, path: Optional[str] = None) -> bool:
+    """Delete one account. True when it existed; clears default_account if it pointed here."""
+    p = config_path(path)
+    data = load_config(path)
+    accounts = data.get("accounts") or {}
+    if name not in accounts:
+        return False
+    del accounts[name]
+    if data.get("default_account") == name:
+        del data["default_account"]
+    _save(p, data)
+    return True
+
+
+def set_default_account(name: Optional[str], *, path: Optional[str] = None) -> Path:
+    """Make one account the default, or None to go back to the top-level keys."""
+    p = config_path(path)
+    data = load_config(path)
+    if name is None:
+        data.pop("default_account", None)
+    else:
+        if name not in (data.get("accounts") or {}):
+            raise ConfigError(f"no account named {name!r}; add it first")
+        data["default_account"] = name
+    return _save(p, data)
+
+
 def resolve_url(flag: Optional[str] = None, *, path: Optional[str] = None,
-                config: Optional[dict] = None) -> Tuple[str, str]:
+                config: Optional[dict] = None,
+                account: Optional[str] = None) -> Tuple[str, str]:
     """(url, where it came from). Raises :class:`UnresolvedError` naming every rung."""
     tried: list[str] = []
     if flag:
@@ -170,7 +318,7 @@ def resolve_url(flag: Optional[str] = None, *, path: Optional[str] = None,
         return _check_url(env, URL_ENV), URL_ENV
     tried.append(f"{URL_ENV} (not set)")
 
-    cfg = load_config(path) if config is None else config
+    cfg = effective_config(account, path=path, config=config)
     p = config_path(path)
     if cfg.get("url"):
         return _check_url(cfg["url"], str(p)), str(p)
@@ -187,7 +335,8 @@ def resolve_url(flag: Optional[str] = None, *, path: Optional[str] = None,
 
 
 def resolve_token(flag: Optional[str] = None, *, path: Optional[str] = None,
-                  config: Optional[dict] = None) -> Tuple[Optional[str], str]:
+                  config: Optional[dict] = None,
+                  account: Optional[str] = None) -> Tuple[Optional[str], str]:
     """(token, where it came from). ``(None, "unauthenticated")`` is a legal answer.
 
     Unlike the URL, an absent token is not an error: plenty of these services
@@ -199,7 +348,7 @@ def resolve_token(flag: Optional[str] = None, *, path: Optional[str] = None,
     env = os.environ.get(TOKEN_ENV)
     if env:
         return env, TOKEN_ENV
-    cfg = load_config(path) if config is None else config
+    cfg = effective_config(account, path=path, config=config)
     tok = cfg.get("token")
     if tok:
         if not isinstance(tok, str):
@@ -209,7 +358,8 @@ def resolve_token(flag: Optional[str] = None, *, path: Optional[str] = None,
 
 
 def resolve_ca_bundle(flag: Optional[str] = None, *, path: Optional[str] = None,
-                      config: Optional[dict] = None) -> Tuple[Any, str]:
+                      config: Optional[dict] = None,
+                      account: Optional[str] = None) -> Tuple[Any, str]:
     """(verify value for httpx, where it came from).
 
     ``True`` means the library's own trust store. A path means a private CA —
@@ -226,7 +376,7 @@ def resolve_ca_bundle(flag: Optional[str] = None, *, path: Optional[str] = None,
         val = os.environ.get(name)
         if val:
             return val, name
-    cfg = load_config(path) if config is None else config
+    cfg = effective_config(account, path=path, config=config)
     bundle = cfg.get("ca_bundle")
     if bundle:
         if not isinstance(bundle, str):
@@ -235,8 +385,28 @@ def resolve_ca_bundle(flag: Optional[str] = None, *, path: Optional[str] = None,
     return True, "default trust store"
 
 
+def resolve_browser_url(flag: Optional[str] = None, *, path: Optional[str] = None,
+                        config: Optional[dict] = None,
+                        account: Optional[str] = None) -> Tuple[Optional[str], str]:
+    """(browser service origin or None, where it came from).
+
+    Optional: the rendering fallback `contents` uses when a site refuses the
+    search service's own fetchers. Absent is legal and means no third rung.
+    """
+    if flag:
+        return _check_url(flag, "--browser-url"), "--browser-url"
+    env = os.environ.get(BROWSER_ENV)
+    if env:
+        return _check_url(env, BROWSER_ENV), BROWSER_ENV
+    cfg = effective_config(account, path=path, config=config)
+    if cfg.get("browser_url"):
+        return _check_url(cfg["browser_url"], str(config_path(path))), str(config_path(path))
+    return None, "not configured"
+
+
 def write_config(url: Optional[str] = None, token: Optional[str] = None, *,
-                 ca_bundle: Optional[str] = None, path: Optional[str] = None) -> Path:
+                 ca_bundle: Optional[str] = None, path: Optional[str] = None,
+                 browser_url: Optional[str] = None) -> Path:
     """Merge these settings into the config file and return where it landed.
 
     A MERGE, not a rewrite: writing only what was passed means setting a URL
@@ -251,20 +421,13 @@ def write_config(url: Optional[str] = None, token: Optional[str] = None, *,
         data["token"] = token
     if ca_bundle is not None:
         data["ca_bundle"] = ca_bundle
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    try:
-        # The file may hold a bearer. Best-effort on platforms where it means
-        # something; never fatal, because a config that could not be chmod'd is
-        # still a config, and failing here would leave it written but unreported.
-        p.chmod(0o600)
-    except OSError:
-        return p
-    return p
+    if browser_url is not None:
+        data["browser_url"] = _check_url(browser_url, "--browser-url")
+    return _save(p, data)
 
 
 def resolution_report(flag_url: Optional[str] = None, flag_token: Optional[str] = None, *,
-                      path: Optional[str] = None) -> list:
+                      path: Optional[str] = None, account: Optional[str] = None) -> list:
     """Display lines describing what each rung would supply, for `doctor`.
 
     Tokens are reported as present/absent with a length, never echoed. A
@@ -279,21 +442,28 @@ def resolution_report(flag_url: Optional[str] = None, flag_token: Optional[str] 
     except ConfigError as exc:
         lines.append(f"config     UNUSABLE: {exc}")
         return lines
+    name, nwhere = resolve_account(account, config=cfg, path=path)
+    lines.append(f"account    {name or '(top level)'}  (from {nwhere})")
     try:
-        url, where = resolve_url(flag_url, path=path, config=cfg)
+        url, where = resolve_url(flag_url, path=path, config=cfg, account=account)
         lines.append(f"url        {url}  (from {where})")
     except (UnresolvedError, ConfigError) as exc:
         lines.append(f"url        UNRESOLVED: {str(exc).splitlines()[0]}")
     try:
-        tok, twhere = resolve_token(flag_token, path=path, config=cfg)
+        tok, twhere = resolve_token(flag_token, path=path, config=cfg, account=account)
         shown = f"set, {len(tok)} chars" if tok else "none"
         lines.append(f"token      {shown}  (from {twhere})")
     except ConfigError as exc:
         lines.append(f"token      UNUSABLE: {exc}")
     try:
-        bundle, bwhere = resolve_ca_bundle(path=path, config=cfg)
+        bundle, bwhere = resolve_ca_bundle(path=path, config=cfg, account=account)
         shown = "library default" if bundle is True else str(bundle)
         lines.append(f"ca bundle  {shown}  (from {bwhere})")
     except ConfigError as exc:
         lines.append(f"ca bundle  UNUSABLE: {exc}")
+    try:
+        burl, bw = resolve_browser_url(path=path, config=cfg, account=account)
+        lines.append(f"browser    {burl or 'none (contents has no render fallback)'}  (from {bw})")
+    except ConfigError as exc:
+        lines.append(f"browser    UNUSABLE: {exc}")
     return lines
