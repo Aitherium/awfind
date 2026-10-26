@@ -24,6 +24,9 @@ Ask one question and get ranked answers back instead of a page of results.
 - [awbrowse](https://aitherium.github.io/awbrowse/) — A portable browser client — navigate, console, network, DOM, screenshot.
 - [awsh](https://aitherium.github.io/awsh/) — Your terminal answers you -- type a question where a command would go.
 - [awembed](https://aitherium.github.io/awembed/) — Train an embedding model that knows your corpus, and prove it beats the big one.
+- [awgraph](https://aitherium.github.io/awgraph/) — A semantic code graph for agents — AST + tree-sitter, call graphs.
+- [awm](https://aitherium.github.io/awm/) — A portable, scoped agent memory.
+- [awgit](https://aitherium.github.io/awgit/) — Semantic version control on top of git — edit-ops and leases.
 
 ## Where it lives
 
