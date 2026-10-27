@@ -6,6 +6,7 @@
     awfind contents https://example.com                   # clean page text
     awfind similar https://example.com --provider exa     # pages like this one
     awfind answer "latest stable podman"                  # answer + citations
+    awfind find "hookd worker pool"                      # web + code + memory + history
     awfind --account work q "..."                         # a named account
     awfind agent-readme                                   # the manual, for an LLM
     awfind providers
@@ -231,6 +232,168 @@ def _self_test_accounts() -> list[str]:
     return failures
 
 
+def _self_test_federate() -> list[str]:
+    """Prove the federation contracts that hold with NO brick installed.
+
+    Every check is pure or uses an injected fake. A self-test that needs an
+    awgraph index, a memory database and a live service is a self-test that
+    gets skipped on exactly the machine where the wiring is broken.
+    """
+    import tempfile
+
+    from awfind.client import Answer
+    from awfind.federate import (
+        KINDS,
+        Passage,
+        exact_passage,
+        federate,
+        merge,
+        parse_git_log,
+        parse_kinds,
+        verbatim,
+    )
+
+    failures: list[str] = []
+
+    # a. Source selector: the default is EVERY source; an unknown name is
+    #    refused with the valid set, never dropped. A dropped name would return
+    #    web results and read as a complete answer to a search that never ran.
+    if parse_kinds() != list(KINDS):
+        failures.append("the default source selector is not every source")
+    if parse_kinds("web, code,web") != ["web", "code"]:
+        failures.append("the source selector did not trim or deduplicate")
+    for bad in ("", "web,nope", []):
+        try:
+            parse_kinds(bad)
+            failures.append(f"the source selector accepted {bad!r}")
+        except ValueError as exc:
+            if bad and "web" not in str(exc):
+                failures.append("an unknown-source error does not list the valid sources")
+
+    # b. Merging normalises each kind by ITS OWN best hit: the raw numbers are
+    #    different scales (a scope weight, a rank position, a relevance score),
+    #    so sorting them raw lets one source's units win every query. Ties fall
+    #    to KINDS order, and a repeated locator is one result.
+    merged = merge([
+        Passage("w", "p", "https://w", "web", 0.10),
+        Passage("c", "p", "a.py:1", "code", 5.0),
+        Passage("c2", "p", "a.py:9", "code", 2.5),
+        Passage("m", "p", "s:k", "memory", 0.9),
+    ], limit=10)
+    if [row.kind for row in merged] != ["web", "code", "memory", "code"]:
+        failures.append(f"merge order wrong: {[row.kind for row in merged]}")
+    if [row.merged_score for row in merged[:3]] != [1.0, 1.0, 1.0]:
+        failures.append("each kind's best hit is not normalised to 1.0")
+    if merged[-1].merged_score != 0.5:
+        failures.append("a kind's second hit did not normalise against its own best")
+    if [row.rank for row in merged] != [1, 2, 3, 4]:
+        failures.append("merge did not number the merged rows")
+    if len(merge([Passage("a", "p", "s:k", "memory", 0.5),
+                  Passage("b", "p", "s:k", "memory", 0.4)], limit=10)) != 1:
+        failures.append("merge did not deduplicate a repeated locator")
+    if len(merge([
+        Passage("w", "p", "https://w", "web", 1.0),
+        Passage("c", "p", "a.py:1", "code", 1.0),
+    ], limit=1)) != 1:
+        failures.append("merge did not apply the limit")
+
+    # c. A passage is a CONTIGUOUS SLICE of its source, and it is verified
+    #    before it is labelled exact: whitespace is not collapsed, no text is
+    #    invented, and an empty source produces no passage.
+    long_value = "x" * 300 + " hookd  pool " + "y" * 300
+    got = exact_passage(long_value, "hookd pool")
+    if "hookd  pool" not in got or len(got) > 600:
+        failures.append("an excerpt did not quote the source around the term")
+    if not verbatim(got, long_value):
+        failures.append("an excerpt is not a verbatim substring of its source")
+    if exact_passage("a  b\n c", "a") != "a  b":
+        failures.append("an excerpt rewrote whitespace instead of slicing the source")
+    if exact_passage("", "q") != "":
+        failures.append("an empty value produced a passage")
+    if verbatim("", "anything") or verbatim("absent", "source text"):
+        failures.append("verbatim accepted text that is not in the source")
+
+    # d. git log parsing reports the exact CHANGED line on the side it belongs
+    #    to, and only when every query term is on it.
+    log = (
+        "\x1e" + "a" * 40 + "\x1fabc1234\x1f2026-01-02\x1ffix the pool\n"
+        "diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n"
+        "@@ -10,0 +11,2 @@\n"
+        "+pool = 24  # hookd workers\n"
+        "+pool = 25\n"
+        "@@ -40 +41,0 @@\n"
+        "-pool = 6\n"
+    )
+    rows = parse_git_log(log, ["hookd", "pool"])
+    if len(rows) != 1 or (rows[0]["line"], rows[0]["side"], rows[0]["path"]) != (
+            11, "added", "x.py"):
+        failures.append(f"git log parsing wrong: {rows}")
+    if parse_git_log(log, ["hookd", "absent"]):
+        failures.append("git log parsing matched a line missing a query term")
+
+    # e. No brick installed: every local source reports unavailable, the web
+    #    answer survives, and NO brick is executed to find this out.
+    class _FakeWeb:
+        def quick(self, query: str, limit: int = 10, auto_learn: bool = False) -> Answer:
+            return Answer({"provider": "fake", "results": [
+                {"title": "Web hit", "url": "https://e.x", "snippet": "web passage",
+                 "score": 0.9, "source": "fake"}]})
+
+    def _must_not_run(*_args: object, **_kwargs: object) -> tuple:
+        raise AssertionError("a brick that is not on PATH was executed")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        payload = federate(
+            "hookd pool", kinds="web,code,memory,history", limit=5, root=tmp,
+            web_client_factory=_FakeWeb, which=lambda _name: None, run=_must_not_run,
+        )
+
+        # f. One brick FAILING is labelled and does not cost the web result —
+        #    the failure mode this whole layer exists to prevent.
+        def _failing_run(argv: list, **_kwargs: object) -> tuple:
+            if "recall" in argv:
+                return 1, "", "memory database is locked\n"
+            raise AssertionError(f"unexpected brick: {argv}")
+
+        mixed = federate(
+            "hookd pool", kinds="web,memory", limit=5, root=tmp,
+            web_client_factory=_FakeWeb,
+            which=lambda name: "/fake/awm" if name == "awm" else None,
+            run=_failing_run,
+        )
+
+        # g. A row whose source cannot supply a verbatim passage is DROPPED and
+        #    COUNTED, not dressed up as an exact hit. An empty memory value is
+        #    the smallest honest case: awm answered, the passage is empty.
+        def _empty_value_run(argv: list, **_kwargs: object) -> tuple:
+            return 0, json.dumps([{"scope": "s", "key": "k", "value": "",
+                                   "weight": 1.0}]), ""
+
+        unverified = federate(
+            "hookd", kinds="memory", limit=5, root=tmp,
+            which=lambda name: "/fake/awm" if name == "awm" else None,
+            run=_empty_value_run,
+        )
+
+    if payload["sources_answered"] != ["web"]:
+        failures.append(f"a missing brick hid the web answer: {payload['sources_answered']}")
+    if sorted(payload["sources_unavailable"]) != ["code", "history", "memory"]:
+        failures.append(f"missing bricks were not reported: {payload['sources']}")
+    if len(payload["results"]) != 1 or payload["results"][0]["kind"] != "web":
+        failures.append("the merged payload lost the one answer it had")
+    if mixed["sources_answered"] != ["web"]:
+        failures.append(f"a failing brick was counted as answered: {mixed['sources']}")
+    memory = [r for r in mixed["sources"] if r["kind"] == "memory"][0]
+    if memory["status"] != "failed" or "locked" not in memory["detail"]:
+        failures.append(f"a failing brick was not reported as failed: {memory}")
+    if len(mixed["results"]) != 1:
+        failures.append("a failing local brick cost the web result")
+    report = unverified["sources"][0]
+    if (report["status"], report["count"], report["dropped"]) != ("answered", 0, 1):
+        failures.append(f"an unverifiable passage was not dropped and counted: {report}")
+    return failures
+
+
 def _self_test() -> int:
     failures: list[str] = []
 
@@ -350,6 +513,7 @@ def _self_test() -> int:
 
     failures.extend(_self_test_resolution())
     failures.extend(_self_test_accounts())
+    failures.extend(_self_test_federate())
 
     for f in failures:
         print(f"  FAIL  {f}")
@@ -363,6 +527,7 @@ def _self_test() -> int:
     print("  PASS  a broken config is reported, not swallowed; TLS never resolves to unverified")
     print("  PASS  research errors raise; citations parse in order; similar() stays in bound")
     print("  PASS  named accounts overlay the top level; an unknown name fails loudly")
+    print("  PASS  federation labels every source; a missing or failing brick never hides web")
     print("SELF-TEST: awfind ok")
     return 0
 
@@ -503,6 +668,61 @@ def _show(ans: Answer, as_json: bool) -> None:
               "check `awfind providers` before concluding the query is unpopular")
 
 
+def _show_federated(payload: dict, as_json: bool) -> None:
+    """One merged list, each row labelled by source, then every source's status.
+
+    The status block is not decoration: a result list with code silently missing
+    is indistinguishable from a repository with no match, and that is the one
+    reading this command must never permit.
+    """
+    if as_json:
+        print(json.dumps(payload, indent=2))
+        return
+    results = payload.get("results") or []
+    for i, row in enumerate(results, 1):
+        print(f"{i}. [{row['kind']}] {row['title']}\n   {row['locator']}")
+        if row.get("passage"):
+            for line in row["passage"].splitlines():
+                print(f"   {line}")
+    if not results:
+        print("no passages — the source statuses below say which source could not answer")
+    print()
+    for report in payload.get("sources") or []:
+        detail = f"  {report['detail']}" if report.get("detail") else ""
+        dropped = int(report.get("dropped") or 0)
+        discarded = f", {dropped} dropped (not verbatim)" if dropped else ""
+        print(f"source {report['kind']:<8} {report['status']:<12} "
+              f"{report['count']} verified hit(s){discarded}{detail}")
+
+
+def _cmd_find(args: argparse.Namespace) -> int:
+    """One query across web and whichever local bricks are installed.
+
+    The web client is built LAZILY inside the web source, so a machine with no
+    service configured still gets code, memory and history — and is told web was
+    unavailable instead of being refused the whole command.
+    """
+    from awfind.federate import federate, parse_kinds
+
+    kinds = parse_kinds(args.sources)
+    if args.scope and "memory" not in kinds:
+        raise ValueError("--scope needs the memory source; add it to --sources")
+    factory = (lambda: _client(args)) if "web" in kinds else None
+    payload = federate(
+        " ".join(args.query),
+        kinds=kinds,
+        limit=args.limit,
+        root=args.root,
+        scope=args.scope,
+        web_client_factory=factory,
+    )
+    _show_federated(payload, args.json)
+    # 1 means every selected source said no; 2 is reserved for "you asked
+    # wrongly". Returning 0 on silence is what lets a script believe a dead
+    # machine answered.
+    return 0 if payload["sources_answered"] else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     # GENERATED doctor intercept (gen_aw_doctor.py) -- do not edit
     _dv = locals().get("argv")
@@ -552,6 +772,16 @@ def main(argv: list[str] | None = None) -> int:
     pa = sub.add_parser("answer", help="one answer with the URLs it cites")
     pa.add_argument("question", nargs="+")
     pa.add_argument("--sources", type=int, default=3, help="pages to read (default 3)")
+    pf = sub.add_parser("find",
+                        help="one query across web, code, memory and git history")
+    pf.add_argument("query", nargs="+")
+    pf.add_argument("--sources", metavar="LIST",
+                    help="comma-separated: web,code,memory,history (default: all)")
+    pf.add_argument("--limit", type=int, default=10,
+                    help="merged results to return (default 10)")
+    pf.add_argument("--root",
+                    help="repository root for code and history (default: the git top level)")
+    pf.add_argument("--scope", help="awm scope to search (default: awm resolves from here)")
     sub.add_parser("agent-readme", help="print the operating manual for an LLM")
 
     acc = sub.add_parser("accounts", help="named service accounts (pick with --account)")
@@ -620,6 +850,15 @@ def main(argv: list[str] | None = None) -> int:
         try:
             return _cmd_config(args)
         except ConfigError as exc:
+            print(f"awfind: {exc}", file=sys.stderr)
+            return 2
+
+    if args.cmd == "find":
+        # Handled BEFORE _client(): a machine with no service URL must still be
+        # able to search its code, memory and history.
+        try:
+            return _cmd_find(args)
+        except ValueError as exc:
             print(f"awfind: {exc}", file=sys.stderr)
             return 2
 

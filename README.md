@@ -63,8 +63,55 @@ Naming an account that does not exist is an error that lists the ones that do.
 It never falls back to the default, because that would send the bearer to the
 service you were trying not to use.
 
+### One search across web, code, memory and history (federated)
+
+```bash
+awfind find "hookd worker pool"                       # all four sources
+awfind find "hookd worker pool" --sources web,code    # just those two
+awfind --json find "hookd worker pool" | jq -r '.results[] | "\(.kind) \(.locator)"'
+```
+
+`find` calls the local bricks when they are installed -- `awgraph` for code
+chunks, `awm` for agent memory, `awgit` (or `git`) for history -- and the
+configured search service for the web, in parallel. Each result carries the
+exact passage and a locator that opens it: `path:line`, `scope:key`,
+`sha:path:line`, or the URL.
+
+Match semantics differ, and each is literal: `awm` matches the query as a
+substring of a memory's key or value, and history reports changed lines that
+contain every query term. Give those sources the term itself, not a sentence;
+web and code are the relevance-ranked sources.
+
+Every local passage is re-read from its source and checked to be a verbatim
+substring before it is returned: the file line at `path:line`, the stored value
+of the memory, the blob at `sha:path` (`sha^:path` for a removed line). Text is
+never reflowed or annotated. A row that cannot be verified is dropped, and its
+source report carries the `dropped` count, so `0 hit(s), 2 dropped` reads
+differently from a real zero. A web result with no snippet has no passage and is
+dropped the same way.
+
+**Why this is client-side.** Those three bricks keep their state on this
+machine: awgraph's chunk cache, awm's SQLite database, git's object store. A
+service in a container cannot read any of it, so a server-side provider would
+have to ship the repository and the owner's memory to the service. The
+federation runs where the data already is. It also keeps a brick version
+independent of awfind: the contract used is each brick's `--json` CLI.
+
+**Nothing fails silently.** Every selected source reports `answered` (with its
+detail and hit count), `unavailable` (not installed or no index, with the
+install line), or `failed` (it ran and broke). The web answer survives a dead
+local brick, and a local answer survives an unconfigured service. Exit 0 means
+at least one source answered; 1 means every selected source said no; 2 is a
+usage or configuration error. Scores are comparable within a kind, and
+`merged_score` normalises each kind's best hit to 1.0 -- the raw numbers are
+different scales, so a merged list is only honest about that if it says so.
+
+The code source loads awgraph's index and measured 51-84 s cold on a
+519,000-chunk repository; pass `--sources web,memory,history` when you need a
+fast answer.
+
 `awfind mcp` exposes the same verbs as `find_contents`, `find_answer` and
-`find_similar`, next to `find` and `find_providers`.
+`find_similar`, next to `find`, `find_all` and `find_providers`.
 
 ## Where it looks for the service
 
@@ -189,6 +236,7 @@ $ awfind --self-test
   PASS  search body is exactly the declared field set, with the service's defaults
   PASS  empty/over-long queries and unknown modes are refused with a reason
   PASS  absent answer is None, missing score is 0.0, results iterate in order
+  PASS  federation labels every source; a missing or failing brick never hides web
 SELF-TEST: awfind ok
 ```
 

@@ -75,8 +75,26 @@ FIND_DESCRIPTION = (
     "or you want nothing written to memory. "
     "PREFER the gateway's web_search when the gateway is up and you want the "
     "results persisted into agent memory for later recall. "
-    "Neither searches this repository's code -- use rg or awgraph for that. "
+    "find() searches the SERVICE only. Call find_all() to also search this "
+    "machine: awgraph code chunks, awm agent memory and git history, merged "
+    "into the same ranked list, with each source reporting answered, "
+    "unavailable or failed. "
     "Queries over 512 characters are refused: distill a prompt into a query."
+)
+
+FIND_ALL_DESCRIPTION = (
+    "One query across everything an agent can see here: awgraph code search, "
+    "awm agent memory, git history, and the configured search service. Returns "
+    "ONE merged, ranked list. Every result carries a title, the EXACT passage, "
+    "a locator precise enough to open it (path:line for code, scope:key for "
+    "memory, sha:path:line for history, URL for web), the source kind, the raw "
+    "score and its meaning. Every selected source reports answered, "
+    "unavailable (not installed, with the install line) or failed -- a missing "
+    "or broken source never aborts the search. Pass kinds to narrow: "
+    "['web'], ['code'], ['memory'], ['history'] or several. code loads "
+    "awgraph's index and can take about a minute on a large repository; omit it "
+    "for a fast web/memory/history search. Queries over 512 characters are "
+    "refused."
 )
 
 
@@ -257,14 +275,40 @@ def run_similar(url: str, limit: int = 10, provider: Optional[str] = None,
     return _guarded(go, client)
 
 
+def run_find_all(query: str, limit: int = 10, kinds: Optional[list[str]] = None,
+                 root: Optional[str] = None, scope: Optional[str] = None) -> str:
+    """The body of the `find_all` tool: local bricks + web, merged and labelled.
+
+    Federation happens in this process, not in the service: the bricks keep
+    their state on this machine (awgraph's chunk cache, awm's SQLite file,
+    git's objects), which a fleet service cannot read. See awfind/federate.py.
+    """
+    from awfind.federate import federate, parse_kinds
+
+    try:
+        wanted = parse_kinds(kinds)
+        if scope and "memory" not in wanted:
+            return "Refused: scope needs the memory source; add it to kinds."
+        payload = federate(
+            query, kinds=wanted,
+            limit=max(1, min(int(limit or 10), MAX_LIMIT)),
+            root=root, scope=scope, web_client_factory=_client,
+        )
+    except ValueError as exc:
+        return f"Refused: {exc}"
+    return json.dumps(payload, indent=1)
+
+
 def build_server():
     """Construct the MCP server. Raises ImportError if `mcp` is absent."""
     server = _build_mcp_server(
         "awfind",
-        "Ranked search over the configured AitherSearch service: web engines, "
-        "model hubs and the owner's browser context. find() answers a question "
-        "with ranked, source-attributed results; find_providers() says which "
-        "backends are live. Read-only: nothing is written or learned.",
+        "One search an agent needs. find() queries the configured "
+        "AitherSearch service; find_all() federates that with local awgraph "
+        "code search, awm agent memory and git history, returning one merged "
+        "list of exact passages with precise locators and a per-source status. "
+        "find_providers() says which service backends are live. Read-only: "
+        "nothing is written or learned.",
     )
 
     @server.tool(name="find", description=FIND_DESCRIPTION)
@@ -283,6 +327,27 @@ def build_server():
         import asyncio
 
         return await asyncio.to_thread(run_find, query, limit, sources, mode)
+
+    @server.tool(name="find_all", description=FIND_ALL_DESCRIPTION)
+    async def find_all(query: str, limit: int = 10,
+                       kinds: Optional[list[str]] = None,
+                       root: Optional[str] = None,
+                       scope: Optional[str] = None) -> str:
+        """Federated search across web, code, memory and history.
+
+        Args:
+            query: The question, as a search query (max 512 chars).
+            limit: Maximum merged results, 1-25.
+            kinds: Sources to search: "web", "code", "memory", "history".
+                Omit for all four. Omit "code" for a fast search.
+            root: Repository root for code and history. Omit to use the git
+                top level of the server's working directory.
+            scope: awm scope to search. Omit to let awm resolve the current
+                repository. Only valid with the memory source.
+        """
+        import asyncio
+
+        return await asyncio.to_thread(run_find_all, query, limit, kinds, root, scope)
 
     @server.tool(
         name="find_providers",

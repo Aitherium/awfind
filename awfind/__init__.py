@@ -34,6 +34,14 @@ from awfind.config import (
     resolve_url,
     write_config,
 )
+from awfind.federate import (
+    KINDS,
+    Passage,
+    SourceReport,
+)
+
+#: The source kinds `awfind find` federates, in their tie-break order.
+FEDERATION_SOURCES = KINDS
 
 __version__ = "0.3.0"
 
@@ -54,5 +62,8 @@ __all__ = [
     "resolve_token",
     "resolve_ca_bundle",
     "write_config",
+    "FEDERATION_SOURCES",
+    "Passage",
+    "SourceReport",
     "__version__",
 ]

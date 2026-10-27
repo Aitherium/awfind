@@ -448,8 +448,48 @@ awfind accounts list               # tokens are never printed
 <p>Naming an account that does not exist is an error that lists the ones that do.
 It never falls back to the default, because that would send the bearer to the
 service you were trying not to use.</p>
+<h3>One search across web, code, memory and history (federated)</h3>
+
+<pre><code>```bash
+awfind find &quot;hookd worker pool&quot;                       # all four sources
+awfind find &quot;hookd worker pool&quot; --sources web,code    # just those two
+awfind --json find &quot;hookd worker pool&quot; | jq -r &#x27;.results[] | &quot;\(.kind) \(.locator)&quot;&#x27;
+</code></pre>
+<p><code>find</code> calls the local bricks when they are installed -- <code>awgraph</code> for code
+chunks, <code>awm</code> for agent memory, <code>awgit</code> (or <code>git</code>) for history -- and the
+configured search service for the web, in parallel. Each result carries the
+exact passage and a locator that opens it: <code>path:line</code>, <code>scope:key</code>,
+<code>sha:path:line</code>, or the URL.</p>
+<p>Match semantics differ, and each is literal: <code>awm</code> matches the query as a
+substring of a memory's key or value, and history reports changed lines that
+contain every query term. Give those sources the term itself, not a sentence;
+web and code are the relevance-ranked sources.</p>
+<p>Every local passage is re-read from its source and checked to be a verbatim
+substring before it is returned: the file line at <code>path:line</code>, the stored value
+of the memory, the blob at <code>sha:path</code> (<code>sha^:path</code> for a removed line). Text is
+never reflowed or annotated. A row that cannot be verified is dropped, and its
+source report carries the <code>dropped</code> count, so <code>0 hit(s), 2 dropped</code> reads
+differently from a real zero. A web result with no snippet has no passage and is
+dropped the same way.</p>
+<p><strong>Why this is client-side.</strong> Those three bricks keep their state on this
+machine: awgraph's chunk cache, awm's SQLite database, git's object store. A
+service in a container cannot read any of it, so a server-side provider would
+have to ship the repository and the owner's memory to the service. The
+federation runs where the data already is. It also keeps a brick version
+independent of awfind: the contract used is each brick's <code>--json</code> CLI.</p>
+<p><strong>Nothing fails silently.</strong> Every selected source reports <code>answered</code> (with its
+detail and hit count), <code>unavailable</code> (not installed or no index, with the
+install line), or <code>failed</code> (it ran and broke). The web answer survives a dead
+local brick, and a local answer survives an unconfigured service. Exit 0 means
+at least one source answered; 1 means every selected source said no; 2 is a
+usage or configuration error. Scores are comparable within a kind, and
+<code>merged_score</code> normalises each kind's best hit to 1.0 -- the raw numbers are
+different scales, so a merged list is only honest about that if it says so.</p>
+<p>The code source loads awgraph's index and measured 51-84 s cold on a
+519,000-chunk repository; pass <code>--sources web,memory,history</code> when you need a
+fast answer.</p>
 <p><code>awfind mcp</code> exposes the same verbs as <code>find_contents</code>, <code>find_answer</code> and
-<code>find_similar</code>, next to <code>find</code> and <code>find_providers</code>.</p>
+<code>find_similar</code>, next to <code>find</code>, <code>find_all</code> and <code>find_providers</code>.</p>
 <h2>Where it looks for the service</h2>
 <p>Highest first, for both the URL and the token:</p>
 <table>
@@ -594,6 +634,7 @@ $ awfind --self-test
   PASS  search body is exactly the declared field set, with the service&#x27;s defaults
   PASS  empty/over-long queries and unknown modes are refused with a reason
   PASS  absent answer is None, missing score is 0.0, results iterate in order
+  PASS  federation labels every source; a missing or failing brick never hides web
 SELF-TEST: awfind ok
 </code></pre>
 <p>The first line is the load-bearing one, and it asserts the <strong>exact</strong> field tuple

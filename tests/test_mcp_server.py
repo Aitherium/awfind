@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 from awfind import mcp_server
@@ -41,7 +43,8 @@ class FakeClient:
     def providers(self):
         return {"providers": [{"name": "duckduckgo", "available": True}]}
 
-ALL_TOOLS = {"find", "find_providers", "find_contents", "find_answer", "find_similar"}
+ALL_TOOLS = {"find", "find_all", "find_providers", "find_contents", "find_answer",
+             "find_similar"}
 
 
 def hit(url, score, source="duckduckgo", title="t"):
@@ -119,6 +122,44 @@ def test_unconfigured_machine_is_reported(monkeypatch, tmp_path):
     assert out.startswith("awfind is not configured") and "AWFIND_URL" in out
 
 
+def test_find_all_refuses_bad_input_before_running_any_source(monkeypatch):
+    called = []
+    monkeypatch.setattr("awfind.federate.federate",
+                        lambda *a, **k: called.append((a, k)) or {})
+    out = mcp_server.run_find_all("q", kinds=["web", "nope"])
+    assert out.startswith("Refused") and "web, code, memory, history" in out
+    assert called == []
+    scoped = mcp_server.run_find_all("q", kinds=["web"], scope="s")
+    assert scoped.startswith("Refused") and "memory" in scoped
+    assert called == []
+
+
+def test_find_all_returns_the_labelled_payload_and_caps_the_limit(monkeypatch):
+    payload = {"query": "q", "sources": [], "results": []}
+    seen = {}
+
+    def fake(query, **kwargs):
+        seen.update(kwargs)
+        return payload
+
+    monkeypatch.setattr("awfind.federate.federate", fake)
+    out = json.loads(mcp_server.run_find_all("q", limit=500, kinds=["web"], root="/r"))
+    assert out == payload
+    assert seen["kinds"] == ["web"] and seen["limit"] == mcp_server.MAX_LIMIT
+    assert seen["root"] == "/r" and seen["web_client_factory"] is mcp_server._client
+
+
+def test_server_find_all_routes_through_run_find_all(monkeypatch):
+    monkeypatch.setattr(
+        mcp_server, "run_find_all",
+        lambda query, limit=10, kinds=None, root=None, scope=None:
+        json.dumps({"query": query, "kinds": kinds}))
+    server = mcp_server.build_server()
+    out = json.loads(_text(asyncio.run(
+        server.call_tool("find_all", {"query": "q", "kinds": ["web"]}))))
+    assert out == {"query": "q", "kinds": ["web"]}
+
+
 # -- the server surface ------------------------------------------------------
 
 mcp = pytest.importorskip("mcp", reason="awfind[mcp] not installed")
@@ -150,9 +191,17 @@ def test_server_find_routes_through_run_find(monkeypatch):
 
 def test_cli_mcp_starts_fast_and_lists_tools_over_stdio():
     """Spawn `python -m awfind.cli mcp` and speak JSON-RPC to it: the real path."""
+    # The subprocess does not inherit conftest's sys.path. Without this it
+    # imports whatever awfind is installed on the machine and silently tests a
+    # different tree -- measured: it listed the old tool set while the tree's
+    # own build_server() had the new one.
+    pkg_root = str(Path(__file__).resolve().parent.parent)
+    env = dict(os.environ)
+    env["PYTHONPATH"] = pkg_root + (
+        os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     proc = subprocess.Popen([sys.executable, "-m", "awfind.cli", "mcp"],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
+                            stderr=subprocess.PIPE, env=env)
     t0 = time.monotonic()
     try:
         def send(msg):
