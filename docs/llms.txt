@@ -27,6 +27,7 @@ Ask one question and get ranked answers back instead of a page of results.
 - [awgraph](https://aitherium.github.io/awgraph/) — A semantic code graph for agents — AST + tree-sitter, call graphs.
 - [awm](https://aitherium.github.io/awm/) — A portable, scoped agent memory.
 - [awgit](https://aitherium.github.io/awgit/) — Semantic version control on top of git — edit-ops and leases.
+- [awindex](https://aitherium.github.io/awindex/) — A curated, git-backed map of the internet — .aither keywords and trust you can check.
 
 ## Where it lives
 
