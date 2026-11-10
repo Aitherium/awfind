@@ -14,17 +14,18 @@
     "awembed",
     "awgraph",
     "awm",
-    "awgit"
+    "awgit",
+    "awindex"
   ],
   "includes": [],
   "metrics": {
     "files": {
-      "value": 36,
-      "as_of": "2026-11-08T07:57:01-08:00"
+      "value": 37,
+      "as_of": "2026-11-08T13:48:35-08:00"
     },
     "tests": {
       "value": 7,
-      "as_of": "2026-11-08T07:57:01-08:00"
+      "as_of": "2026-11-08T13:48:35-08:00"
     }
   }
 }
